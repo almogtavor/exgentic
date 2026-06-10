@@ -84,8 +84,28 @@ def run_bash(
 
 
 def generate_patch(env, cwd: str, base_commit: str) -> str:
-    """Generate patch from staged changes."""
-    command = f"git add -A && git diff --staged {base_commit} | cat"
+    """Generate patch from staged changes.
+
+    `git add -A` honors .git/info/exclude for *untracked* files, so we register
+    virtualenvs (by common name and by the pyvenv.cfg marker, which catches any
+    venv name) and build artifacts there before staging. This guarantees an
+    accidental in-repo `python -m venv` / `pip install` can never pollute the
+    patch. Tracked source edits are unaffected - git always stages tracked
+    changes - so a real fix is still captured and a run that made no real edit
+    still yields an empty patch.
+    """
+    exclude_patterns = [
+        ".venv/", "venv/", "env/", "ENV/", "virtualenv/",
+        "site-packages/", "*.egg-info/", "__pycache__/", "*.pyc",
+        ".tox/", ".pytest_cache/", ".mypy_cache/", "node_modules/",
+    ]
+    printf_args = " ".join(f"'{p}'" for p in exclude_patterns)
+    command = (
+        f"printf '%s\\n' {printf_args} >> .git/info/exclude; "
+        "find . -maxdepth 6 -name pyvenv.cfg 2>/dev/null "
+        "| sed 's#/pyvenv.cfg##; s#^\\./##; s#$#/#' >> .git/info/exclude; "
+        f"git add -A && git diff --staged {base_commit} | cat"
+    )
     output = env.execute(command=command, cwd=cwd)
     return output["output"]
 

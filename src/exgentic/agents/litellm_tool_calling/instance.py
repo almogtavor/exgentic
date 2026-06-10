@@ -11,6 +11,7 @@ import litellm
 from litellm import (
     ChatCompletionAssistantMessage,
     ChatCompletionDeveloperMessage,
+    ChatCompletionSystemMessage,
     ChatCompletionToolMessage,
     ChatCompletionUserMessage,
 )
@@ -57,6 +58,8 @@ class LiteLLMToolCallingAgentInstance(AgentInstance):
         model_settings: ModelSettings | None = None,
         allow_truncated_messages: bool = False,
         litellm_params_extra: dict[str, object] | None = None,
+        max_repeated_tool_calls: int = 0,
+        system_prompt_file: str | None = None,
     ):
         super().__init__(session_id)
         self.model = model
@@ -71,6 +74,10 @@ class LiteLLMToolCallingAgentInstance(AgentInstance):
             raise ValueError("model_settings must be a ModelSettings instance.")
         self._allow_truncated_messages = allow_truncated_messages
         self._litellm_params_extra: dict[str, object] = dict(litellm_params_extra or {})
+        self._max_repeated_tool_calls = max(0, int(max_repeated_tool_calls or 0))
+        # signature -> length of the current consecutive-issuance streak
+        self._repeat_counts: dict[str, int] = {}
+        self._system_prompt_file = system_prompt_file
         self._use_cache = settings.litellm_caching
         self.logger.debug(
             "LiteLLM cache %s (dir=%s)",
@@ -107,6 +114,26 @@ class LiteLLMToolCallingAgentInstance(AgentInstance):
         self._all_actions: list[ActionType] = list(self.actions)
         self._registry = ToolsActionsRegistry(self._all_actions)
 
+        # Optional system prompt. system_prompt_file: "" = explicitly none,
+        # a path = read it, None = legacy fallback (env var, then global file).
+        import os as _os
+
+        _sys_prompt = ""
+        if self._system_prompt_file is None:
+            _sys_prompt = _os.environ.get("EXGENTIC_AGENT_SYSTEM_PROMPT", "").strip()
+            if not _sys_prompt:
+                _sp_file = _os.path.expanduser("~/.exgentic/agent_system_prompt.txt")
+                if _os.path.exists(_sp_file):
+                    _sys_prompt = open(_sp_file, encoding="utf-8").read().strip()
+        elif self._system_prompt_file:
+            _sys_prompt = (
+                open(_os.path.expanduser(self._system_prompt_file), encoding="utf-8")
+                .read()
+                .strip()
+            )
+        if _sys_prompt:
+            self._add_message(ChatCompletionSystemMessage(role="system", content=_sys_prompt))
+
         # Seed conversation with task + context
         ctx = ""
         if self.context:
@@ -115,6 +142,23 @@ class LiteLLMToolCallingAgentInstance(AgentInstance):
 
     def _register_cost(self, usage: litellm.Usage):
         self._cost_data.update_cost_from_tokens(usage.prompt_tokens, usage.completion_tokens)
+
+    # Cap on a single tool result fed back into the conversation. Uncapped tool
+    # output (e.g. a full test-suite log) can flood the 131K context window long
+    # before the agent converges.
+    _TOOL_RESULT_MAX_CHARS = 12000
+
+    @classmethod
+    def _truncate_tool_result(cls, content: str) -> str:
+        if len(content) <= cls._TOOL_RESULT_MAX_CHARS:
+            return content
+        head = content[: cls._TOOL_RESULT_MAX_CHARS - 3000]
+        tail = content[-2500:]
+        omitted = len(content) - len(head) - len(tail)
+        return (
+            f"{head}\n...[tool output truncated: {omitted} chars omitted; "
+            f"re-run with a narrower command (grep/head) to see specific parts]...\n{tail}"
+        )
 
     def _add_message(self, message):
         self.logger.info(f"Adding message to chat history: {message}")
@@ -155,6 +199,7 @@ class LiteLLMToolCallingAgentInstance(AgentInstance):
                     content = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
                 except TypeError:
                     content = str(value)
+                content = self._truncate_tool_result(content)
                 self._add_message(ChatCompletionToolMessage(role="tool", tool_call_id=tool_call_id, content=content))
             else:
                 self._add_message(ChatCompletionUserMessage(role="user", content=str(obs)))
@@ -313,6 +358,63 @@ class LiteLLMToolCallingAgentInstance(AgentInstance):
 
         return tool_calls
 
+    @staticmethod
+    def _tool_call_signature(tool_call: ToolCall) -> str:
+        """Canonical identity of a call: name + arguments (key-order independent)."""
+        args = tool_call.get("arguments") or ""
+        try:
+            args = json.dumps(json.loads(args), sort_keys=True, separators=(",", ":"))
+        except (TypeError, ValueError):
+            args = str(args)
+        return f"{tool_call.get('name')}:{args}"
+
+    def _filter_repeated_tool_calls(
+        self, tool_calls: list[ToolCall]
+    ) -> tuple[list[ToolCall], list[ToolCall]]:
+        """Split a turn's tool calls into (allowed, blocked).
+
+        A call is blocked when executing it would be the Nth consecutive
+        issuance of the exact same call (N = max_repeated_tool_calls), counting
+        duplicates within the same turn. Streaks reset for any signature not
+        issued in the current turn.
+        """
+        if not self._max_repeated_tool_calls:
+            return tool_calls, []
+        allowed: list[ToolCall] = []
+        blocked: list[ToolCall] = []
+        seen_now: dict[str, int] = {}
+        for tool_call in tool_calls:
+            sig = self._tool_call_signature(tool_call)
+            streak = self._repeat_counts.get(sig, 0) + seen_now.get(sig, 0)
+            if streak + 1 >= self._max_repeated_tool_calls:
+                blocked.append(tool_call)
+            else:
+                allowed.append(tool_call)
+            seen_now[sig] = seen_now.get(sig, 0) + 1
+        self._repeat_counts = {
+            sig: self._repeat_counts.get(sig, 0) + n for sig, n in seen_now.items()
+        }
+        return allowed, blocked
+
+    def _add_blocked_tool_result(self, tool_call: ToolCall) -> None:
+        self._add_message(
+            ChatCompletionToolMessage(
+                role="tool",
+                tool_call_id=tool_call["id"],
+                content=(
+                    "[harness] Blocked: you already issued this exact tool call "
+                    "multiple times in a row; it was NOT executed again. Repeating "
+                    "it will keep producing the same result. Take a different next "
+                    "step that moves toward the fix (read the relevant code, make "
+                    "the edit, or verify with git diff)."
+                ),
+            )
+        )
+
+    # Bound on same-step re-prompts when every tool call in a turn was blocked
+    # by the repetition guard; past this, the calls execute anyway (no deadlock).
+    _MAX_REPEAT_REPROMPTS = 3
+
     def react(self, observation: Observation | None) -> Action | None:
         self._step_count += 1
         if self._step_count > self.max_steps:
@@ -321,50 +423,87 @@ class LiteLLMToolCallingAgentInstance(AgentInstance):
 
         self._observe(observation)
 
-        response = self._completion(
-            model=self.model,
-            messages=self.messages,
-            tools=self._assistant_tools(),
-            **({"tool_choice": self.model_settings.tool_choice} if self.model_settings.tool_choice else {}),
-            caching=self._use_cache,
-        )
-
-        self._register_cost(response.usage)
-
-        choice = response["choices"][0]
-        message = choice["message"]
-        finish_reason = choice.get("finish_reason")
-
-        if finish_reason == "tool_calls":
-            tool_calls = self._extract_tool_calls(message)
-            self._add_message(
-                ChatCompletionAssistantMessage(
-                    role="assistant",
-                    tool_calls=[
-                        {
-                            "id": tool_call["id"],
-                            "type": "function",
-                            "function": {
-                                "name": tool_call["name"],
-                                "arguments": tool_call["arguments"],
-                            },
-                        }
-                        for tool_call in tool_calls
-                    ],
-                )
-            )
-            actions = self._registry.tool_calls_to_action(tool_calls)
-        else:
-            actions = MessageAction(arguments=Message(content=message.content))
-            self._add_message(
-                ChatCompletionAssistantMessage(
-                    role="assistant",
-                    content=message.content,
-                )
+        reprompts = 0
+        while True:
+            response = self._completion(
+                model=self.model,
+                messages=self.messages,
+                tools=self._assistant_tools(),
+                # Passed only when set, so the default (litellm "auto") is preserved. Lets
+                # models that cannot freely emit the tool-call format use guided decoding
+                # via tool_choice="required".
+                **(
+                    {"tool_choice": self.model_settings.tool_choice}
+                    if self.model_settings.tool_choice
+                    else {}
+                ),
+                caching=self._use_cache,
             )
 
-        self.logger.info(f"Invoking action: {actions}")
-        return actions
+            self._register_cost(response.usage)
+
+            choice = response["choices"][0]
+            message = choice["message"]
+            finish_reason = choice.get("finish_reason")
+
+            if finish_reason == "tool_calls":
+                tool_calls = self._extract_tool_calls(message)
+                self._add_message(
+                    ChatCompletionAssistantMessage(
+                        role="assistant",
+                        tool_calls=[
+                            {
+                                "id": tool_call["id"],
+                                "type": "function",
+                                "function": {
+                                    "name": tool_call["name"],
+                                    "arguments": tool_call["arguments"],
+                                },
+                            }
+                            for tool_call in tool_calls
+                        ],
+                    )
+                )
+                allowed, blocked = self._filter_repeated_tool_calls(tool_calls)
+                if blocked and not allowed and reprompts < self._MAX_REPEAT_REPROMPTS:
+                    for tool_call in blocked:
+                        self._add_blocked_tool_result(tool_call)
+                    reprompts += 1
+                    self.logger.warning(
+                        "Repetition guard blocked the whole turn (%d calls); "
+                        "re-prompting (%d/%d)",
+                        len(blocked),
+                        reprompts,
+                        self._MAX_REPEAT_REPROMPTS,
+                    )
+                    continue
+                if blocked and not allowed:
+                    # Re-prompt budget exhausted and the model still insists:
+                    # execute rather than deadlock the session.
+                    self.logger.warning(
+                        "Repetition guard exhausted re-prompts; executing %d "
+                        "repeated calls anyway",
+                        len(blocked),
+                    )
+                    allowed, blocked = tool_calls, []
+                for tool_call in blocked:
+                    self.logger.warning(
+                        "Repetition guard blocked tool call: %s",
+                        self._tool_call_signature(tool_call)[:200],
+                    )
+                    self._add_blocked_tool_result(tool_call)
+                actions = self._registry.tool_calls_to_action(allowed)
+            else:
+                actions = MessageAction(arguments=Message(content=message.content))
+                self._add_message(
+                    ChatCompletionAssistantMessage(
+                        role="assistant",
+                        content=message.content,
+                    )
+                )
+
+            self.logger.info(f"Invoking action: {actions}")
+            return actions
 
     def _completion(self, **kwargs):
         call_kwargs = self.model_settings.model_dump(
