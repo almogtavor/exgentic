@@ -24,6 +24,14 @@ class LiteLLMToolCallingAgent(Agent):
     model_settings: ModelSettings | None = None
     allow_truncated_messages: bool = False
     litellm_params_extra: dict[str, Any] = Field(default_factory=dict)
+    # Block the Nth consecutive identical tool call (same name + arguments).
+    # 0 disables the guard. E.g. 3 allows two identical calls in a row and
+    # blocks the third with a synthetic tool result instead of executing it.
+    max_repeated_tool_calls: int = 0
+    # System prompt source. None = legacy fallback (EXGENTIC_AGENT_SYSTEM_PROMPT
+    # env var, then ~/.exgentic/agent_system_prompt.txt). "" = explicitly no
+    # system prompt (ignores env/global file). Any other value = path to read.
+    system_prompt_file: str | None = None
 
     @classmethod
     def _get_instance_class(cls):
@@ -55,4 +63,6 @@ class LiteLLMToolCallingAgent(Agent):
             "model_settings": self.model_settings,
             "allow_truncated_messages": self.allow_truncated_messages,
             "litellm_params_extra": self.litellm_params_extra,
+            "max_repeated_tool_calls": self.max_repeated_tool_calls,
+            "system_prompt_file": self.system_prompt_file,
         }
