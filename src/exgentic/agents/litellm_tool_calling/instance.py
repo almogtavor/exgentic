@@ -116,6 +116,23 @@ class LiteLLMToolCallingAgentInstance(AgentInstance):
     def _register_cost(self, usage: litellm.Usage):
         self._cost_data.update_cost_from_tokens(usage.prompt_tokens, usage.completion_tokens)
 
+    # Cap on a single tool result fed back into the conversation. Uncapped tool
+    # output (e.g. a full test-suite log) can flood the context window long
+    # before the agent converges.
+    _TOOL_RESULT_MAX_CHARS = 12000
+
+    @classmethod
+    def _truncate_tool_result(cls, content: str) -> str:
+        if len(content) <= cls._TOOL_RESULT_MAX_CHARS:
+            return content
+        head = content[: cls._TOOL_RESULT_MAX_CHARS - 3000]
+        tail = content[-2500:]
+        omitted = len(content) - len(head) - len(tail)
+        return (
+            f"{head}\n...[tool output truncated: {omitted} chars omitted; "
+            f"re-run with a narrower command (grep/head) to see specific parts]...\n{tail}"
+        )
+
     def _add_message(self, message):
         self.logger.info(f"Adding message to chat history: {message}")
         self.messages.append(message)
@@ -155,6 +172,7 @@ class LiteLLMToolCallingAgentInstance(AgentInstance):
                     content = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
                 except TypeError:
                     content = str(value)
+                content = self._truncate_tool_result(content)
                 self._add_message(ChatCompletionToolMessage(role="tool", tool_call_id=tool_call_id, content=content))
             else:
                 self._add_message(ChatCompletionUserMessage(role="user", content=str(obs)))
