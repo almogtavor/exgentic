@@ -47,10 +47,10 @@ def litellm_tokens_cost(input_tokens: int, output_tokens: int, model_name: str) 
             )
         except Exception:
             continue
-    raise ValueError(
-        f"No pricing info found for model '{model_name}'. "
-        f"Add it to the name_map in exgentic/utils/cost.py or check litellm model support."
-    )
+    # No pricing info for this model (e.g. a self-hosted or fine-tuned model not
+    # in litellm's registry). Cost tracking is best-effort, so fall back to zero
+    # rather than aborting the run.
+    return TokensCost(input_cost=0.0, output_cost=0.0, total_cost=0.0)
 
 
 class CostReport(BaseModel):
