@@ -24,6 +24,10 @@ class LiteLLMToolCallingAgent(Agent):
     model_settings: ModelSettings | None = None
     allow_truncated_messages: bool = False
     litellm_params_extra: dict[str, Any] = Field(default_factory=dict)
+    # System prompt source. None = fall back to the EXGENTIC_AGENT_SYSTEM_PROMPT
+    # env var then ~/.exgentic/agent_system_prompt.txt. "" = explicitly no system
+    # prompt (ignores env / global file). Any other value = path to read.
+    system_prompt_file: str | None = None
 
     @classmethod
     def _get_instance_class(cls):
@@ -55,4 +59,5 @@ class LiteLLMToolCallingAgent(Agent):
             "model_settings": self.model_settings,
             "allow_truncated_messages": self.allow_truncated_messages,
             "litellm_params_extra": self.litellm_params_extra,
+            "system_prompt_file": self.system_prompt_file,
         }

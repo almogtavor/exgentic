@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from typing import Any, Union
 
@@ -11,6 +12,7 @@ import litellm
 from litellm import (
     ChatCompletionAssistantMessage,
     ChatCompletionDeveloperMessage,
+    ChatCompletionSystemMessage,
     ChatCompletionToolMessage,
     ChatCompletionUserMessage,
 )
@@ -57,6 +59,7 @@ class LiteLLMToolCallingAgentInstance(AgentInstance):
         model_settings: ModelSettings | None = None,
         allow_truncated_messages: bool = False,
         litellm_params_extra: dict[str, object] | None = None,
+        system_prompt_file: str | None = None,
     ):
         super().__init__(session_id)
         self.model = model
@@ -71,6 +74,7 @@ class LiteLLMToolCallingAgentInstance(AgentInstance):
             raise ValueError("model_settings must be a ModelSettings instance.")
         self._allow_truncated_messages = allow_truncated_messages
         self._litellm_params_extra: dict[str, object] = dict(litellm_params_extra or {})
+        self._system_prompt_file = system_prompt_file
         self._use_cache = settings.litellm_caching
         self.logger.debug(
             "LiteLLM cache %s (dir=%s)",
@@ -107,11 +111,36 @@ class LiteLLMToolCallingAgentInstance(AgentInstance):
         self._all_actions: list[ActionType] = list(self.actions)
         self._registry = ToolsActionsRegistry(self._all_actions)
 
+        system_prompt = self._resolve_system_prompt()
+        if system_prompt:
+            self._add_message(ChatCompletionSystemMessage(role="system", content=system_prompt))
+
         # Seed conversation with task + context
         ctx = ""
         if self.context:
             ctx = "".join(f"\n<{k}>\n{v}\n</{k}>" for k, v in self.context.items())
         self._add_message(ChatCompletionUserMessage(role="user", content=f"{self.task}\n{ctx}"))
+
+    def _resolve_system_prompt(self) -> str:
+        """Resolve the system prompt for this run.
+
+        ``system_prompt_file`` semantics: a path reads that file, ``""`` is an
+        explicit "no system prompt", and ``None`` falls back to the
+        EXGENTIC_AGENT_SYSTEM_PROMPT env var then ~/.exgentic/agent_system_prompt.txt.
+        """
+        if self._system_prompt_file is not None:
+            if not self._system_prompt_file:
+                return ""
+            path = os.path.expanduser(self._system_prompt_file)
+            return open(path, encoding="utf-8").read().strip()
+
+        env_prompt = os.environ.get("EXGENTIC_AGENT_SYSTEM_PROMPT", "").strip()
+        if env_prompt:
+            return env_prompt
+        global_file = os.path.expanduser("~/.exgentic/agent_system_prompt.txt")
+        if os.path.exists(global_file):
+            return open(global_file, encoding="utf-8").read().strip()
+        return ""
 
     def _register_cost(self, usage: litellm.Usage):
         self._cost_data.update_cost_from_tokens(usage.prompt_tokens, usage.completion_tokens)
