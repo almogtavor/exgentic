@@ -84,8 +84,38 @@ def run_bash(
 
 
 def generate_patch(env, cwd: str, base_commit: str) -> str:
-    """Generate patch from staged changes."""
-    command = f"git add -A && git diff --staged {base_commit} | cat"
+    """Generate the agent's patch, guarding against accidental pollution.
+
+    `git add -A` honors .git/info/exclude for *untracked* files, so we register
+    virtualenvs (by common name and by the pyvenv.cfg marker, which catches any
+    venv name), build artifacts, and the agent's reproduction scratch projects
+    there before staging. This keeps a stray in-repo `python -m venv` / `pip
+    install` or a `repro/` project out of the patch.
+
+    info/exclude only affects untracked files, so it cannot undo edits to
+    *tracked* build/CI config (setup.py, tox.ini, ...). A SWE-bench fix never
+    legitimately changes those and a stray edit there breaks PASS_TO_PASS, so we
+    revert them to the base commit before staging. Tracked source edits are
+    untouched, so a real fix is still captured.
+    """
+    exclude_patterns = [
+        ".venv/", "venv/", "env/", "ENV/", "virtualenv/",
+        "site-packages/", "*.egg-info/", "__pycache__/", "*.pyc",
+        ".tox/", ".pytest_cache/", ".mypy_cache/", "node_modules/",
+        "repro/", "repro_app/", "reproduce/", "repro_project/", "scratch/",
+        "/repro.py", "/reproduce.py", "/repro_*.py", "/reproduce_*.py",
+        "/test_repro*.py", "/debug_*.py", "/bug_*.py",
+    ]
+    revert_files = ["setup.py", "setup.cfg", "tox.ini", "pyproject.toml", ".pylintrc", "MANIFEST.in"]
+    printf_args = " ".join(f"'{p}'" for p in exclude_patterns)
+    revert_args = " ".join(revert_files)
+    command = (
+        f"printf '%s\\n' {printf_args} >> .git/info/exclude; "
+        "find . -maxdepth 6 -name pyvenv.cfg 2>/dev/null "
+        "| sed 's#/pyvenv.cfg##; s#^\\./##; s#$#/#' >> .git/info/exclude; "
+        f"git checkout {base_commit} -- {revert_args} 2>/dev/null || true; "
+        f"git add -A && git diff --staged {base_commit} | cat"
+    )
     output = env.execute(command=command, cwd=cwd)
     return output["output"]
 
