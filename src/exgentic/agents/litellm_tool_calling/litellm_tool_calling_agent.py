@@ -24,6 +24,10 @@ class LiteLLMToolCallingAgent(Agent):
     model_settings: ModelSettings | None = None
     allow_truncated_messages: bool = False
     litellm_params_extra: dict[str, Any] = Field(default_factory=dict)
+    # Block the Nth consecutive identical tool call (same name + arguments). 0
+    # disables the guard. E.g. 3 allows two identical calls in a row and blocks
+    # the third with a synthetic tool result instead of executing it.
+    max_repeated_tool_calls: int = 0
 
     @classmethod
     def _get_instance_class(cls):
@@ -55,4 +59,5 @@ class LiteLLMToolCallingAgent(Agent):
             "model_settings": self.model_settings,
             "allow_truncated_messages": self.allow_truncated_messages,
             "litellm_params_extra": self.litellm_params_extra,
+            "max_repeated_tool_calls": self.max_repeated_tool_calls,
         }

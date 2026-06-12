@@ -57,6 +57,7 @@ class LiteLLMToolCallingAgentInstance(AgentInstance):
         model_settings: ModelSettings | None = None,
         allow_truncated_messages: bool = False,
         litellm_params_extra: dict[str, object] | None = None,
+        max_repeated_tool_calls: int = 0,
     ):
         super().__init__(session_id)
         self.model = model
@@ -71,6 +72,8 @@ class LiteLLMToolCallingAgentInstance(AgentInstance):
             raise ValueError("model_settings must be a ModelSettings instance.")
         self._allow_truncated_messages = allow_truncated_messages
         self._litellm_params_extra: dict[str, object] = dict(litellm_params_extra or {})
+        self._max_repeated_tool_calls = max(0, int(max_repeated_tool_calls or 0))
+        self._repeat_counts: dict[str, int] = {}  # signature -> consecutive-issuance streak
         self._use_cache = settings.litellm_caching
         self.logger.debug(
             "LiteLLM cache %s (dir=%s)",
@@ -313,6 +316,47 @@ class LiteLLMToolCallingAgentInstance(AgentInstance):
 
         return tool_calls
 
+    @staticmethod
+    def _tool_call_signature(tool_call: ToolCall) -> str:
+        """Canonical identity of a call: name + arguments (key-order independent)."""
+        args = tool_call.get("arguments") or ""
+        try:
+            args = json.dumps(json.loads(args), sort_keys=True, separators=(",", ":"))
+        except (TypeError, ValueError):
+            args = str(args)
+        return f"{tool_call.get('name')}:{args}"
+
+    def _filter_repeated_tool_calls(self, tool_calls: list[ToolCall]) -> tuple[list[ToolCall], list[ToolCall]]:
+        """Split a turn's tool calls into (allowed, blocked).
+
+        A call is blocked when it would be the Nth consecutive issuance of the exact
+        same call (N = max_repeated_tool_calls), counting in-turn duplicates; streaks
+        reset for any signature not issued in the current turn.
+        """
+        if not self._max_repeated_tool_calls:
+            return tool_calls, []
+        allowed: list[ToolCall] = []
+        blocked: list[ToolCall] = []
+        seen_now: dict[str, int] = {}
+        for tool_call in tool_calls:
+            sig = self._tool_call_signature(tool_call)
+            streak = self._repeat_counts.get(sig, 0) + seen_now.get(sig, 0)
+            (blocked if streak + 1 >= self._max_repeated_tool_calls else allowed).append(tool_call)
+            seen_now[sig] = seen_now.get(sig, 0) + 1
+        self._repeat_counts = {sig: self._repeat_counts.get(sig, 0) + n for sig, n in seen_now.items()}
+        return allowed, blocked
+
+    _BLOCKED_TOOL_RESULT = (
+        "[harness] Blocked: you already issued this exact tool call multiple times in a row; it "
+        "was NOT executed again. Repeating it keeps producing the same result. Take a different "
+        "next step that moves toward the goal."
+    )
+
+    def _add_blocked_tool_result(self, tool_call: ToolCall) -> None:
+        self._add_message(
+            ChatCompletionToolMessage(role="tool", tool_call_id=tool_call["id"], content=self._BLOCKED_TOOL_RESULT)
+        )
+
     def react(self, observation: Observation | None) -> Action | None:
         self._step_count += 1
         if self._step_count > self.max_steps:
@@ -353,7 +397,11 @@ class LiteLLMToolCallingAgentInstance(AgentInstance):
                     ],
                 )
             )
-            actions = self._registry.tool_calls_to_action(tool_calls)
+            allowed, blocked = self._filter_repeated_tool_calls(tool_calls)
+            for tool_call in blocked:
+                self.logger.warning("Repetition guard blocked tool call: %s", tool_call.get("name"))
+                self._add_blocked_tool_result(tool_call)
+            actions = self._registry.tool_calls_to_action(allowed)
         else:
             actions = MessageAction(arguments=Message(content=message.content))
             self._add_message(
