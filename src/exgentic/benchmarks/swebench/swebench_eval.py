@@ -435,7 +435,10 @@ class SWEBenchSession(Session):
 
         from .kube_sandbox import KubernetesEnvironment
 
-        ts = make_test_spec(self._instance)
+        # namespace= gives the *pullable* image name (e.g.
+        # swebench/sweb.eval.x86_64.<id>) rather than the local build key.
+        img_ns = os.environ.get("SWEBENCH_IMAGE_NAMESPACE", "swebench")
+        ts = make_test_spec(self._instance, namespace=img_ns)
         ns = (
             os.environ.get("EXGENTIC_KUBERNETES_NAMESPACE")
             or os.environ.get("POD_NAMESPACE")

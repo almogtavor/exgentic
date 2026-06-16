@@ -178,9 +178,11 @@ def grade_in_pod(env: KubernetesEnvironment, instance: dict, model_patch: str,
 
     from .swebench_evaluation import HarnessResult, is_patch_valid
 
+    import os
+
     instance_id = instance["instance_id"]
     valid = is_patch_valid(model_patch)
-    ts = make_test_spec(instance)
+    ts = make_test_spec(instance, namespace=os.environ.get("SWEBENCH_IMAGE_NAMESPACE", "swebench"))
     base = instance["base_commit"]
 
     # Clean checkout at base, then apply exactly the submitted patch (matches
