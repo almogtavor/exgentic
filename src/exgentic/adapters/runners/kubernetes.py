@@ -20,19 +20,25 @@ runtime *inside* the pod (there is no host Docker socket to bind-mount).
 When ``docker_socket=True`` the runner provisions one so the existing
 sibling-container + ``run_evaluation`` grading code runs unchanged:
 
-* ``sandbox="podman"`` (default) — rootless podman baked into the image,
-  exposed as ``DOCKER_HOST``; runs under the given (anyuid) service account.
-* ``sandbox="dind"`` — a privileged ``docker:dind`` sidecar sharing a socket
-  ``emptyDir``; the runner's ``DOCKER_HOST`` points at it.
+* ``sandbox="dind"`` — a privileged ``docker:dind`` sidecar runs ``dockerd``
+  and shares ``/var/run`` with the runner; ``DOCKER_HOST`` points at its
+  socket. Self-contained: works with any image.
+* ``sandbox="podman"`` (default) — rootless, no privileged. The runner image
+  must provide ``podman``; the runner starts ``podman system service`` on
+  ``unix:///tmp/podman.sock`` (backgrounded before ``exgentic serve``) and
+  points ``DOCKER_HOST`` at it. If the image has no podman, use ``dind``.
 
-A per-task k8s-Pod sandbox backend (no privileged) is intentionally out of
-scope for this runner.
+For SWE-bench specifically there is also a docker-free, non-privileged
+alternative that does not need this runner at all: a per-task Pod backend
+(``SWEBENCH_SANDBOX=kubernetes``) where each task's environment is its own Pod
+built from the instance image - see ``benchmarks/swebench/kube_sandbox.py``.
 """
 
 from __future__ import annotations
 
 import atexit
 import json
+import shlex
 import shutil
 import subprocess
 import time
@@ -242,10 +248,18 @@ class KubernetesRunner:
                     "env": [{"name": "DOCKER_TLS_CERTDIR", "value": ""}],
                     "volumeMounts": [{"name": "dind-sock", "mountPath": "/var/run"}],
                 })
-            else:  # rootless podman baked into the image
+            else:  # rootless podman served from inside the runner image
+                sock = "unix:///tmp/podman.sock"
                 runner_container.setdefault("env", []).append(
-                    {"name": "DOCKER_HOST", "value": "unix:///tmp/podman.sock"}
+                    {"name": "DOCKER_HOST", "value": sock}
                 )
+                # The image must provide podman; start its API service in the
+                # background, then exec the serve command so DOCKER_HOST is live.
+                inner = " ".join(shlex.quote(c) for c in serve_cmd)
+                runner_container["command"] = [
+                    "sh", "-c",
+                    f"podman system service --time=0 {sock} >/tmp/podman.log 2>&1 & exec {inner}",
+                ]
 
         spec: dict[str, Any] = {
             "restartPolicy": "Never",
