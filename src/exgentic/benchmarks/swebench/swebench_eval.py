@@ -295,6 +295,24 @@ class SWEBenchSession(Session):
         if self._final_patch is None:
             self.logger.info("SCORE | Harness evaluation skipped: no patch available for evaluation")
             return None
+
+        import os
+
+        if os.environ.get("SWEBENCH_SANDBOX", "").lower() == "kubernetes":
+            try:
+                from .kube_sandbox import grade_in_pod
+
+                return grade_in_pod(
+                    env=self.env,
+                    instance=self._instance,
+                    model_patch=self._final_patch,
+                    test_output_path=self.paths.benchmark_dir / "test_output.txt",
+                    logger=self.logger,
+                )
+            except Exception as e:  # noqa: BLE001 - grading must not crash the run
+                self.logger.exception(f"SCORE | Pod grading failed: {e}")
+                return None
+
         try:
             return swebench_evaluation.run_harness(
                 patch=self._final_patch,
@@ -371,7 +389,14 @@ class SWEBenchSession(Session):
     # -------------------------------------------------------------------------
 
     def _setup_environment(self) -> None:
-        """Initialize the Docker environment for the task."""
+        """Initialize the task environment (Docker container, or a Pod when
+        ``SWEBENCH_SANDBOX=kubernetes`` - no docker/privileged)."""
+        import os
+
+        if os.environ.get("SWEBENCH_SANDBOX", "").lower() == "kubernetes":
+            self._setup_kube_environment()
+            return
+
         self.logger.info("ENV | Setting up environment")
         from ...utils.container_reaper import docker_run_label_args
         from ...utils.logging import capture_stdio_to_session
@@ -397,6 +422,46 @@ class SWEBenchSession(Session):
 
         if self.container_base_commit != self._instance["base_commit"]:
             self.logger.error(
+                f"ENV | Base commit mismatch: expected {self._instance['base_commit']} "
+                f"| got {self.container_base_commit}"
+            )
+
+    def _setup_kube_environment(self) -> None:
+        """Pod-native env: each task runs in its own Pod from the SWE-bench
+        instance image, exec'd via kubectl. No docker, no privileged."""
+        import os
+
+        from swebench.harness.test_spec.test_spec import make_test_spec
+
+        from .kube_sandbox import KubernetesEnvironment
+
+        ts = make_test_spec(self._instance)
+        ns = (
+            os.environ.get("EXGENTIC_KUBERNETES_NAMESPACE")
+            or os.environ.get("POD_NAMESPACE")
+            or "default"
+        )
+        sa = os.environ.get("SWEBENCH_SANDBOX_SA") or None
+        pull = [
+            s.strip()
+            for s in os.environ.get("EXGENTIC_KUBERNETES_IMAGE_PULL_SECRETS", "").split(",")
+            if s.strip()
+        ]
+        self.logger.info(f"ENV | Pod sandbox: image {ts.instance_image_key} in ns {ns}")
+        self.env = KubernetesEnvironment(
+            image=ts.instance_image_key,
+            namespace=ns,
+            service_account=sa,
+            image_pull_secrets=pull,
+            cwd=self.container_repo_dir,
+            timeout=self._timeout if isinstance(self._timeout, int) else 1800,
+            pull_timeout=self._environment_pull_timeout,
+            logger=self.logger,
+        )
+        result = self.env.execute(command="git rev-parse HEAD", cwd=self.container_repo_dir)
+        self.container_base_commit = result["output"].strip()
+        if self.container_base_commit != self._instance["base_commit"]:
+            self.logger.warning(
                 f"ENV | Base commit mismatch: expected {self._instance['base_commit']} "
                 f"| got {self.container_base_commit}"
             )
