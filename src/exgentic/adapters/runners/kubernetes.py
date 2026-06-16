@@ -99,6 +99,7 @@ class KubernetesRunner:
         image: str | None = None,
         namespace: str | None = None,
         service_account: str | None = None,
+        image_pull_secrets: list[str] | None = None,
         resources: dict[str, Any] | None = None,
         env_secrets: list[str] | None = None,
         env: dict[str, str] | None = None,
@@ -126,6 +127,7 @@ class KubernetesRunner:
         self._image = image
         self._namespace = namespace or self._current_namespace()
         self._service_account = service_account
+        self._image_pull_secrets = image_pull_secrets or []
         self._resources = resources
         self._env_secrets = env_secrets or []
         self._extra_env = env or {}
@@ -252,6 +254,8 @@ class KubernetesRunner:
         }
         if self._service_account:
             spec["serviceAccountName"] = self._service_account
+        if self._image_pull_secrets:
+            spec["imagePullSecrets"] = [{"name": n} for n in self._image_pull_secrets]
         if self._node_selector:
             spec["nodeSelector"] = self._node_selector
         return spec
@@ -363,11 +367,12 @@ class KubernetesRunner:
         if self._pf_proc is not None:
             self._pf_proc.terminate()
             self._pf_proc = None
-        from ...utils.container_reaper import LABEL_OWNER_TOKEN, OWN_TOKEN
-
-        sel = f"{LABEL_OWNER_TOKEN.replace('.', '_')}={OWN_TOKEN}"
+        # Scope teardown to THIS instance (app=<name>): concurrent per-task
+        # sessions share one owner token, so deleting by token would reap
+        # siblings. The owner-token label stays on the resources for the
+        # process-wide reaper's best-effort sweep on abnormal exit.
         _kubectl(
             "delete", "pod,job,service,configmap", "-n", self._namespace,
-            "-l", sel, "--ignore-not-found", "--wait=false",
+            "-l", f"app={self._name}", "--ignore-not-found", "--wait=false",
             check=False, capture_output=True, text=True,
         )

@@ -122,6 +122,7 @@ def with_runner(
             "image",
             "namespace",
             "service_account",
+            "image_pull_secrets",
             "resources",
             "env_secrets",
             "env",
