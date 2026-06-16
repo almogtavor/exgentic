@@ -54,7 +54,6 @@ class ExgenticSettings(BaseSettings):
     kubernetes_service_account: str | None = None
     kubernetes_image_pull_secrets: str | None = None  # comma-separated secret names
     kubernetes_output_pvc: str | None = None
-    kubernetes_sandbox: str = "podman"
     # In-cluster orchestrators reach the spawned service over cluster DNS; set
     # EXGENTIC_KUBERNETES_PORT_FORWARD=false there. Laptops keep it true.
     kubernetes_port_forward: bool = True

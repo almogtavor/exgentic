@@ -15,30 +15,17 @@ dependency).  Reach the service either over in-cluster DNS
 (``<svc>.<ns>.svc.cluster.local``) or, when driving from a laptop, over a
 ``kubectl port-forward`` (``port_forward=True``).
 
-SWE-bench and other ``docker_socket=True`` benchmarks need a container
-runtime *inside* the pod (there is no host Docker socket to bind-mount).
-When ``docker_socket=True`` the runner provisions one so the existing
-sibling-container + ``run_evaluation`` grading code runs unchanged:
-
-* ``sandbox="dind"`` — a privileged ``docker:dind`` sidecar runs ``dockerd``
-  and shares ``/var/run`` with the runner; ``DOCKER_HOST`` points at its
-  socket. Self-contained: works with any image.
-* ``sandbox="podman"`` (default) — rootless, no privileged. The runner image
-  must provide ``podman``; the runner starts ``podman system service`` on
-  ``unix:///tmp/podman.sock`` (backgrounded before ``exgentic serve``) and
-  points ``DOCKER_HOST`` at it. If the image has no podman, use ``dind``.
-
-For SWE-bench specifically there is also a docker-free, non-privileged
-alternative that does not need this runner at all: a per-task Pod backend
-(``SWEBENCH_SANDBOX=kubernetes``) where each task's environment is its own Pod
-built from the instance image - see ``benchmarks/swebench/kube_sandbox.py``.
+The runner is deliberately a thin "run ``exgentic serve`` in a Pod" mechanism
+with no container-runtime concerns. SWE-bench, which needs a per-task
+environment, has its own docker-free, non-privileged backend that creates one
+Pod per task from the instance image - see
+``benchmarks/swebench/kube_sandbox.py`` (``SWEBENCH_SANDBOX=kubernetes``).
 """
 
 from __future__ import annotations
 
 import atexit
 import json
-import shlex
 import shutil
 import subprocess
 import time
@@ -60,7 +47,6 @@ from .service import HTTPTransport, _wait_for_health
 from .transport import ObjectProxy
 
 _RUNTIME_MOUNT = "/etc/exgentic/runtime.json"
-_DIND_IMAGE = "docker:27-dind"
 
 
 def _kubectl(*args: str, check: bool = True, stdin: str | None = None, **kwargs: Any) -> subprocess.CompletedProcess:
@@ -92,8 +78,6 @@ class KubernetesRunner:
     health_timeout:  Seconds to wait for ``/health`` (k8s scheduling is slow).
     port_forward:    Reach the service via ``kubectl port-forward`` (laptop) vs
                      in-cluster DNS (when the orchestrator itself runs in-cluster).
-    docker_socket:   Provision an in-pod container runtime (see ``sandbox``).
-    sandbox:         ``"podman"`` | ``"dind"`` — in-pod runtime when docker_socket.
     """
 
     def __init__(
@@ -116,8 +100,6 @@ class KubernetesRunner:
         use_job: bool = False,
         health_timeout: float = 180.0,
         port_forward: bool = True,
-        docker_socket: bool = False,
-        sandbox: str = "podman",
         role: Role | None = None,
         **kwargs: Any,
     ) -> None:
@@ -144,8 +126,6 @@ class KubernetesRunner:
         self._use_job = use_job
         self._health_timeout = health_timeout
         self._port_forward = port_forward
-        self._docker_socket = docker_socket
-        self._sandbox = sandbox
         self._role = role
 
         self._name = f"exgentic-{uuid4().hex[:8]}"
@@ -230,40 +210,9 @@ class KubernetesRunner:
         if self._security_context:
             runner_container["securityContext"] = self._security_context
 
-        containers = [runner_container]
-
-        # SWE-bench & friends: a container runtime inside the pod.
-        if self._docker_socket:
-            if self._sandbox == "dind":
-                sock = {"name": "dind-sock", "emptyDir": {}}
-                volumes.append(sock)
-                mounts.append({"name": "dind-sock", "mountPath": "/var/run"})
-                runner_container.setdefault("env", []).append(
-                    {"name": "DOCKER_HOST", "value": "unix:///var/run/docker.sock"}
-                )
-                containers.append({
-                    "name": "dind",
-                    "image": _DIND_IMAGE,
-                    "securityContext": {"privileged": True},
-                    "env": [{"name": "DOCKER_TLS_CERTDIR", "value": ""}],
-                    "volumeMounts": [{"name": "dind-sock", "mountPath": "/var/run"}],
-                })
-            else:  # rootless podman served from inside the runner image
-                sock = "unix:///tmp/podman.sock"
-                runner_container.setdefault("env", []).append(
-                    {"name": "DOCKER_HOST", "value": sock}
-                )
-                # The image must provide podman; start its API service in the
-                # background, then exec the serve command so DOCKER_HOST is live.
-                inner = " ".join(shlex.quote(c) for c in serve_cmd)
-                runner_container["command"] = [
-                    "sh", "-c",
-                    f"podman system service --time=0 {sock} >/tmp/podman.log 2>&1 & exec {inner}",
-                ]
-
         spec: dict[str, Any] = {
             "restartPolicy": "Never",
-            "containers": containers,
+            "containers": [runner_container],
             "volumes": volumes,
         }
         if self._service_account:

@@ -133,8 +133,6 @@ def with_runner(
             "use_job",
             "health_timeout",
             "port_forward",
-            "docker_socket",
-            "sandbox",
         ):
             if key in kwargs:
                 k8s_kw[key] = kwargs.pop(key)

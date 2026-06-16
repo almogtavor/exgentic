@@ -38,11 +38,8 @@ class RunnerMixin:
             kw: dict[str, Any] = {
                 "env_name": f"{kind}/{self.slug_name}",
                 "module_path": type(self).__module__,
-                "sandbox": s.kubernetes_sandbox,
                 "port_forward": s.kubernetes_port_forward,
             }
-            if self.docker_socket:
-                kw["docker_socket"] = True
             if s.kubernetes_image:
                 kw["image"] = s.kubernetes_image
             if s.kubernetes_namespace:
