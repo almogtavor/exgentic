@@ -208,10 +208,26 @@ def grade_in_pod(env: KubernetesEnvironment, instance: dict, model_patch: str,
         KEY_PREDICTION: model_patch or "",
         "model_name_or_path": "exgentic",
     }
-    report = get_eval_report(ts, prediction, str(test_output_path), include_tests_status=True)
-    logger.info(f"KUBE | grade {instance_id}: resolved={report.get(instance_id, {}).get('resolved')}")
+    per_instance = get_eval_report(ts, prediction, str(test_output_path), include_tests_status=True)
+    inst = per_instance.get(instance_id, {})
+    resolved = bool(inst.get("resolved", False))
+    logger.info(f"KUBE | grade {instance_id}: resolved={resolved}")
+
+    # The score is assembled from two shapes (matching the docker harness):
+    #  (1) a per-instance report.json in benchmark_dir, scanned for resolved +
+    #      per-test (FAIL_TO_PASS / PASS_TO_PASS) results;
+    #  (2) the run-summary shape consumed by _apply_harness_data.
+    try:
+        (test_output_path.parent / "report.json").write_text(json.dumps(per_instance))
+    except OSError as e:  # pragma: no cover - best effort
+        logger.warning(f"KUBE | could not write report.json: {e}")
+    summary = {
+        "submitted_ids": [instance_id],
+        "completed_ids": [instance_id],
+        "resolved_instances": 1 if resolved else 0,
+    }
     return HarnessResult(
-        harness_report=report,
+        harness_report=summary,
         patch=model_patch or "",
         patch_valid=valid,
         harness_ran=True,
