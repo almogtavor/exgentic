@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shlex
 import shutil
 import subprocess
@@ -69,6 +70,12 @@ class KubernetesEnvironment:
         self.image_pull_secrets = image_pull_secrets or []
         self.cwd = cwd
         self.timeout = timeout
+        # Pod lifetime is decoupled from the per-command timeout: a session can run
+        # for far longer than any single bash command (esp. middleware modes whose
+        # per-step latency is higher), and the pod must outlive the WHOLE session so
+        # grade_in_pod can still kubectl-exec into it at the end. If the pod's sleep
+        # expired mid-session the task silently went ungraded. Generous, env-tunable.
+        self.pod_ttl = int(os.environ.get("SWEBENCH_POD_TTL", "14400"))
         self.pull_timeout = pull_timeout
         self.env = env or {}
         self.pod_name = f"swebench-{uuid4().hex[:8]}"
@@ -81,8 +88,9 @@ class KubernetesEnvironment:
             "name": "task",
             "image": self.image,
             # The instance image's filesystem (repo at /testbed, conda env) is
-            # what we exec into; just keep it alive.
-            "command": ["sleep", str(self.timeout)],
+            # what we exec into; keep it alive for the whole session (pod_ttl),
+            # NOT just one command timeout, so end-of-session grading can exec in.
+            "command": ["sleep", str(self.pod_ttl)],
             "workingDir": self.cwd,
             "imagePullPolicy": "IfNotPresent",
         }
