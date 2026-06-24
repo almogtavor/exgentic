@@ -86,17 +86,19 @@ class LiteLLMToolCallingAgentInstance(AgentInstance):
             ]
         ] = []
         self._step_count = 0
-        # Repeated-tool-call loop breaker. Gemma-4 (and reasoning models generally)
+        # Repeated-tool-call HARD loop breaker. Gemma-4 (and reasoning models generally)
         # can degenerate into re-issuing the *identical* tool call forever - e.g. re-
         # running the same reproduction script hundreds of times without ever editing
-        # the source (vLLM #40080; the logit distribution collapses toward repeating
-        # and sampler penalties only "partially help"). When the same (name, arguments)
-        # is emitted N times in a row, queue a nudge that gets appended to the next tool
-        # result so the model gets *different* feedback and breaks out of the loop.
+        # the source (vLLM #40080; the logit distribution collapses toward repeating and
+        # sampler penalties only "partially help" - a soft nudge gets ignored). So once the
+        # same (name, arguments) repeats _max_repeated_tool_calls times in a row, react()
+        # REFUSES to execute it: it injects a synthetic "blocked" tool result and re-queries
+        # the model in-place so it must pick a different action. After _max_hard_block_retries
+        # unproductive re-queries the session is ended (the trajectory has collapsed).
         self._max_repeated_tool_calls = 3
+        self._max_hard_block_retries = 3
         self._last_tool_sig = None
         self._tool_repeat = 0
-        self._repeat_nudge: str | None = None
         self._cost_data = LiteLLMCostReport.initialize_empty(model_name=self.model)
 
         # Check model accessibility
@@ -166,46 +168,28 @@ class LiteLLMToolCallingAgentInstance(AgentInstance):
                     content = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
                 except TypeError:
                     content = str(value)
-                if self._repeat_nudge:
-                    content = f"{content}\n\n[SYSTEM NOTICE] {self._repeat_nudge}"
-                    self._repeat_nudge = None
                 self._add_message(ChatCompletionToolMessage(role="tool", tool_call_id=tool_call_id, content=content))
             else:
                 self._add_message(ChatCompletionUserMessage(role="user", content=str(obs)))
 
-    def _check_repeated_tool_calls(self, tool_calls: list) -> None:
-        """Detect a degenerate loop where the model re-issues the identical tool call.
+    def _repeat_count(self, tool_calls: list) -> int:
+        """Track consecutive identical tool-call signatures; return the current run length.
 
-        Tracks the (name, arguments) signature of each turn's tool calls. After
-        ``self._max_repeated_tool_calls`` identical calls in a row, queues a nudge that
-        ``_observe`` appends to the next tool result, so the model sees *different* text
-        and breaks out instead of looping forever (gemma-4 repetition collapse, vLLM
-        #40080). Self-resets after nudging so it fires again if the loop continues.
+        Gemma-4 (and reasoning models) can collapse into re-issuing the *identical* tool
+        call forever (vLLM #40080). ``react`` uses this count to HARD-BLOCK execution once
+        the same (name, arguments) repeats ``_max_repeated_tool_calls`` times in a row.
         """
         if not tool_calls:
             self._last_tool_sig = None
             self._tool_repeat = 0
-            return
+            return 0
         sig = tuple((tc.get("name"), tc.get("arguments")) for tc in tool_calls)
         if sig == self._last_tool_sig:
             self._tool_repeat += 1
         else:
             self._last_tool_sig = sig
             self._tool_repeat = 1
-        if self._tool_repeat >= self._max_repeated_tool_calls:
-            self.logger.warning(
-                "Repeated identical tool call x%d - injecting loop-breaker nudge",
-                self._tool_repeat,
-            )
-            self._repeat_nudge = (
-                f"You have issued this exact same command {self._tool_repeat} times in a "
-                "row and received the same result each time. Stop repeating it - the "
-                "output already confirms the behavior. Take a DIFFERENT action now: edit "
-                "the relevant source file to fix the bug (then re-run to verify), or "
-                "inspect a different file. Do not run this same command again."
-            )
-            self._tool_repeat = 0
-            self._last_tool_sig = None
+        return self._tool_repeat
 
     def _assistant_tools(self) -> list[dict[str, Any]]:
         """Returns list of available tools in openai format.
@@ -369,23 +353,40 @@ class LiteLLMToolCallingAgentInstance(AgentInstance):
 
         self._observe(observation)
 
-        response = self._completion(
-            model=self.model,
-            messages=self.messages,
-            tools=self._assistant_tools(),
-            **({"tool_choice": self.model_settings.tool_choice} if self.model_settings.tool_choice else {}),
-            caching=self._use_cache,
-        )
+        # Hard loop interrupt: if the model emits the *identical* tool call past the repeat
+        # threshold, refuse to execute it - inject a synthetic "blocked" tool result and
+        # re-query the model in-place so it must choose a DIFFERENT action. After
+        # _max_hard_block_retries unproductive re-queries, end the session (the trajectory
+        # has provably collapsed; vLLM #40080). Re-queries do NOT consume an agent step.
+        hard_blocks = 0
+        while True:
+            response = self._completion(
+                model=self.model,
+                messages=self.messages,
+                tools=self._assistant_tools(),
+                **({"tool_choice": self.model_settings.tool_choice} if self.model_settings.tool_choice else {}),
+                caching=self._use_cache,
+            )
 
-        self._register_cost(response.usage)
+            self._register_cost(response.usage)
 
-        choice = response["choices"][0]
-        message = choice["message"]
-        finish_reason = choice.get("finish_reason")
+            choice = response["choices"][0]
+            message = choice["message"]
+            finish_reason = choice.get("finish_reason")
 
-        if finish_reason == "tool_calls":
+            if finish_reason != "tool_calls":
+                actions = MessageAction(arguments=Message(content=message.content))
+                self._add_message(
+                    ChatCompletionAssistantMessage(
+                        role="assistant",
+                        content=message.content,
+                    )
+                )
+                self.logger.info(f"Invoking action: {actions}")
+                return actions
+
             tool_calls = self._extract_tool_calls(message)
-            self._check_repeated_tool_calls(tool_calls)
+            repeat = self._repeat_count(tool_calls)
             self._add_message(
                 ChatCompletionAssistantMessage(
                     role="assistant",
@@ -402,18 +403,42 @@ class LiteLLMToolCallingAgentInstance(AgentInstance):
                     ],
                 )
             )
-            actions = self._registry.tool_calls_to_action(tool_calls)
-        else:
-            actions = MessageAction(arguments=Message(content=message.content))
-            self._add_message(
-                ChatCompletionAssistantMessage(
-                    role="assistant",
-                    content=message.content,
-                )
-            )
 
-        self.logger.info(f"Invoking action: {actions}")
-        return actions
+            if tool_calls and repeat >= self._max_repeated_tool_calls:
+                if hard_blocks >= self._max_hard_block_retries:
+                    self.logger.warning(
+                        "Finished: identical tool call still repeating after %d hard blocks "
+                        "- ending degenerate session",
+                        hard_blocks,
+                    )
+                    return None
+                hard_blocks += 1
+                self.logger.warning(
+                    "HARD-BLOCK identical tool call x%d (block %d/%d) - refusing to execute, re-querying",
+                    repeat,
+                    hard_blocks,
+                    self._max_hard_block_retries,
+                )
+                block_msg = (
+                    f"[BLOCKED] This exact command was just issued {repeat} times in a row and "
+                    "was NOT executed. Repeating it cannot make progress - the result will not "
+                    "change. You MUST take a DIFFERENT action now: edit the relevant source file "
+                    "with str_replace/create to fix the bug, view a different file, or call "
+                    "finish if you are done. Do not issue this same command again."
+                )
+                for tool_call in tool_calls:
+                    self._add_message(
+                        ChatCompletionToolMessage(
+                            role="tool",
+                            tool_call_id=tool_call["id"],
+                            content=block_msg,
+                        )
+                    )
+                continue
+
+            actions = self._registry.tool_calls_to_action(tool_calls)
+            self.logger.info(f"Invoking action: {actions}")
+            return actions
 
     def _completion(self, **kwargs):
         call_kwargs = self.model_settings.model_dump(
