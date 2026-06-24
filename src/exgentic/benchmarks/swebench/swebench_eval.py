@@ -90,8 +90,16 @@ def run_bash(
 
 
 def generate_patch(env, cwd: str, base_commit: str) -> str:
-    """Generate patch from staged changes."""
-    command = f"git add -A && git diff --staged {base_commit} | cat"
+    """Generate patch from staged changes.
+
+    safe.directory '*' makes git trust the repo even when /testbed is owned by a
+    different uid than the exec user (otherwise git refuses with "dubious ownership"
+    and emits nothing to stdout -> an empty, silently-wrong patch).
+    """
+    command = (
+        "git config --global --add safe.directory '*' 2>/dev/null; "
+        f"git add -A && git diff --staged {base_commit} | cat"
+    )
     output = env.execute(command=command, cwd=cwd)
     return output["output"]
 

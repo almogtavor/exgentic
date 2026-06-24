@@ -94,7 +94,17 @@ class KubernetesEnvironment:
             "workingDir": self.cwd,
             "imagePullPolicy": "IfNotPresent",
         }
-        spec: dict[str, Any] = {"restartPolicy": "Never", "containers": [container]}
+        # Run as root: SWE-bench instance images own /testbed (repo + .git) as root.
+        # Without this, OpenShift's SCC assigns a random uid that cannot write the
+        # root-owned source files AND trips git's "dubious ownership" guard, so
+        # `git add -A && git diff` returns empty -> correct fixes are captured as an
+        # empty patch and scored 0. (exgentic-task SA carries anyuid, so root schedules.)
+        container["securityContext"] = {"runAsUser": 0}
+        spec: dict[str, Any] = {
+            "restartPolicy": "Never",
+            "containers": [container],
+            "securityContext": {"runAsUser": 0},
+        }
         if self.service_account:
             spec["serviceAccountName"] = self.service_account
         if self.image_pull_secrets:
