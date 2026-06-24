@@ -216,7 +216,21 @@ def grade_in_pod(env: KubernetesEnvironment, instance: dict, model_patch: str,
         if ap["returncode"] != 0:
             logger.warning(f"KUBE | model patch did not apply cleanly:\n{ap['output'][-2000:]}")
 
-    env.write_file("/eval.sh", ts.eval_script)
+    # Old SWE-bench repos (astropy era) build their editable install via
+    # setuptools.dep_util, removed in setuptools>=70. If the grading env's setuptools
+    # is too new, the rebuild + conftest import fail silently and pytest can't collect
+    # -> every FAIL_TO_PASS is marked failed even when the fix is correct. Pin <70 in
+    # the runtime env (legacy setup.py uses the *runtime* setuptools, so PIP_CONSTRAINT
+    # alone is not enough) only when dep_util is actually missing, and constrain later
+    # pip so the eval script can't re-upgrade past it. No-op for envs already <70.
+    setuptools_guard = (
+        "source /opt/miniconda3/bin/activate testbed 2>/dev/null || true\n"
+        "printf 'setuptools<70\\n' > /tmp/exg_setuptools_constraint.txt\n"
+        "export PIP_CONSTRAINT=/tmp/exg_setuptools_constraint.txt\n"
+        "python -c 'import setuptools.dep_util' 2>/dev/null || "
+        "pip install 'setuptools<70' -q 2>/dev/null || true\n"
+    )
+    env.write_file("/eval.sh", setuptools_guard + ts.eval_script)
     result = env.execute("chmod +x /eval.sh && /eval.sh 2>&1")
     test_output_path.parent.mkdir(parents=True, exist_ok=True)
     test_output_path.write_text(result["output"])
