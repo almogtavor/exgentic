@@ -99,6 +99,12 @@ class LiteLLMToolCallingAgentInstance(AgentInstance):
         self._max_hard_block_retries = 3
         self._last_tool_sig = None
         self._tool_repeat = 0
+        # The model can also degenerate into text-only responses (no tool call) forever:
+        # exgentic replies "Sending a message is not allowed" and the model repeats. The
+        # hard-block only catches repeated TOOL CALLS, so cap consecutive no-action
+        # (message) responses and end the session once exceeded.
+        self._max_consecutive_messages = 5
+        self._consecutive_messages = 0
         self._cost_data = LiteLLMCostReport.initialize_empty(model_name=self.model)
 
         # Check model accessibility
@@ -375,6 +381,17 @@ class LiteLLMToolCallingAgentInstance(AgentInstance):
             finish_reason = choice.get("finish_reason")
 
             if finish_reason != "tool_calls":
+                # Text-only response = no valid action. The model degenerates into emitting
+                # these forever (each gets "Sending a message is not allowed"); end the
+                # session once it repeats past the cap (the trajectory has collapsed).
+                self._consecutive_messages += 1
+                if self._consecutive_messages >= self._max_consecutive_messages:
+                    self.logger.warning(
+                        "Finished: %d consecutive no-action (text-only) responses "
+                        "- ending degenerate session",
+                        self._consecutive_messages,
+                    )
+                    return None
                 actions = MessageAction(arguments=Message(content=message.content))
                 self._add_message(
                     ChatCompletionAssistantMessage(
@@ -436,6 +453,7 @@ class LiteLLMToolCallingAgentInstance(AgentInstance):
                     )
                 continue
 
+            self._consecutive_messages = 0  # valid action -> reset the no-action loop counter
             actions = self._registry.tool_calls_to_action(tool_calls)
             self.logger.info(f"Invoking action: {actions}")
             return actions
